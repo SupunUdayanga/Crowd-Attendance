@@ -2,335 +2,156 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:permission_handler/permission_handler.dart';
-import '../services/session_service.dart';
+import '../services/scanner_bindings.dart';
+import '../services/round_scanner_controller.dart';
+import '../services/detection_gate.dart';
 
 class ScannerScreen extends StatefulWidget {
   final String sessionId;
+  final ScannerBindings? bindings;
 
-  const ScannerScreen({super.key, required this.sessionId});
+  const ScannerScreen({super.key, required this.sessionId, this.bindings});
 
   @override
   State<ScannerScreen> createState() => _ScannerScreenState();
 }
 
 class _ScannerScreenState extends State<ScannerScreen> {
-  final _sessionService = SessionService();
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  
-  // 🎯 CRITICAL: Must match Student App's SERVICE_UUID exactly!
-  static const String SERVICE_UUID = 'bf27730d-860a-4e09-8f3c-7a2b5d9e4f1c';
-  
+  late final ScannerBindings _bindings;
+  late final RoundScannerController _rounds;
   bool _isScanning = false;
+  bool _busy = false;
+  bool _ending = false;
+  String? _sessionError;
+  bool get _unavailable =>
+      _busy ||
+      _ending ||
+      _sessionData['status'] != 'active' ||
+      _sessionError != null;
   Map<String, dynamic> _sessionData = {};
-  Set<String>? _enrolledRegNos;
-  Map<String, Map<String, dynamic>> _detectedStudents = {}; // regNo -> data
-  StreamSubscription? _sessionStream;
-  StreamSubscription? _attendanceStream;
-  StreamSubscription? _scanSubscription;
-  
-  Set<String> _scannedInCurrentRound = {}; // Track students scanned in the current active round
-  int _devicesFound = 0; // Debug counter
+  Map<String, Map<String, dynamic>> _detectedStudents = {};
+  int _devicesFound = 0;
+  StreamSubscription? _sessionStream,
+      _attendanceStream,
+      _scanSubscription,
+      _radioStream;
 
   @override
   void initState() {
     super.initState();
-    _initializeScanner();
+    _bindings = widget.bindings ?? ScannerBindings.forSession(widget.sessionId);
+    _rounds = _bindings.rounds;
+    _sessionStream = _bindings.session.listen(
+      (data) {
+        if (mounted) {
+          setState(() {
+            _sessionData = data ?? {};
+            _sessionError = data == null
+                ? 'Session not found. Return to your sessions.'
+                : null;
+          });
+        }
+      },
+      onError: (Object error) {
+        if (mounted) {
+          setState(() => _sessionError = 'Cannot load session: $error');
+        }
+      },
+    );
+    _attendanceStream = _bindings.attendance.listen((data) {
+      if (mounted) setState(() => _detectedStudents = data);
+    }, onError: (Object error) => _showError('Cannot load attendance: $error'));
+    _radioStream = _bindings.radio.listen((running) {
+      if (!running && _isScanning) {
+        _rounds.gate.pause(); // timeout/radio loss pauses, never completes
+        if (mounted) setState(() => _isScanning = false);
+      }
+    });
   }
 
   @override
   void dispose() {
-    _stopScanning();
+    _rounds.dispose();
     _sessionStream?.cancel();
     _attendanceStream?.cancel();
     _scanSubscription?.cancel();
+    _radioStream?.cancel();
+    unawaited(_bindings.stopRadio().catchError((Object _) {}));
     super.dispose();
   }
 
-  Future<void> _initializeScanner() async {
-    // Listen to session updates
-    _sessionStream = _sessionService.getSessionStream(widget.sessionId).listen(
-      (snapshot) async {
-        if (snapshot.exists && mounted) {
-          final data = snapshot.data() as Map<String, dynamic>;
-          setState(() {
-            _sessionData = data;
-          });
-          
-          if (_enrolledRegNos == null) {
-            final code = data['module_code'] ?? data['module'] ?? '';
-            if (code.isNotEmpty) {
-              await _fetchEnrolledStudents(code);
-            }
-          }
-        }
-      },
-    );
-
-    // Listen to attendance records
-    _attendanceStream = _sessionService
-        .getAttendanceRecordsStream(widget.sessionId)
-        .listen(
-      (snapshot) {
-        if (mounted) {
-          final students = <String, Map<String, dynamic>>{};
-          for (var doc in snapshot.docs) {
-            final data = doc.data() as Map<String, dynamic>;
-            students[data['reg_no']] = data;
-          }
-          setState(() => _detectedStudents = students);
-        }
-      },
-    );
-
-    // Note: removed auto-start scanning. The user must manually start a scan round.
-  }
-
-  Future<void> _fetchEnrolledStudents(String moduleCode) async {
+  Future<void> _startScanning() async {
+    if (_unavailable) return;
+    setState(() => _busy = true);
     try {
-      final moduleKey = moduleCode.toUpperCase().trim();
-      final snap = await _firestore
-          .collection('students')
-          .where('enrolled_module_ids', arrayContains: moduleKey)
-          .get();
-      
-      final regNos = <String>{};
-      for (var doc in snap.docs) {
-        final data = doc.data();
-        if (data['reg_no'] != null) {
-          regNos.add(data['reg_no'].toString().trim());
-        }
+      await _bindings.requestRadio();
+      if (!mounted) return;
+      await _rounds.start();
+      if (!mounted) return;
+      await _scanSubscription?.cancel();
+      if (!mounted) return;
+      _scanSubscription = _bindings.results.listen(
+        (results) {
+          for (final result in results) {
+            _processScanResult(result);
+          }
+        },
+        onError: (Object error) {
+          _rounds.gate.pause();
+          if (mounted) setState(() => _isScanning = false);
+          _showError('Scan paused: $error');
+        },
+      );
+      await _bindings.startRadio();
+      if (!mounted) {
+        await _bindings.stopRadio();
+        return;
       }
-      
       if (mounted) {
         setState(() {
-          _enrolledRegNos = regNos;
+          _isScanning = true;
+          _devicesFound = 0;
         });
       }
-      print("🎓 Fetched ${regNos.length} enrolled students for module $moduleKey");
-    } catch (e) {
-      print("❌ Error fetching enrolled students: $e");
+    } catch (error) {
+      _rounds.gate.pause();
+      _showError('Scan not started: $error. Retry resumes the saved round.');
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _requestPermissions() async {
-    if (await Permission.bluetoothScan.isDenied) {
-      await Permission.bluetoothScan.request();
-    }
-    if (await Permission.bluetoothConnect.isDenied) {
-      await Permission.bluetoothConnect.request();
-    }
-    if (await Permission.location.isDenied) {
-      await Permission.location.request();
-    }
-  }
-
-  Future<void> _startScanning() async {
+  Future<void> _processScanResult(ScanResult result) async {
     try {
-      await _requestPermissions();
-
-      // Check if Bluetooth is on
-      if (await FlutterBluePlus.isSupported == false) {
-        throw Exception('Bluetooth not supported on this device');
-      }
-
-      setState(() {
-        _isScanning = true;
-        _devicesFound = 0;
-        _scannedInCurrentRound.clear(); // Reset for the new round
-      });
-
-      print("========================================");
-      print("🔵 LECTURER APP: Starting BLE Scan");
-      print("🎯 Target Service UUID: $SERVICE_UUID");
-      print("========================================");
-
-      // 🎯 CRITICAL FIX: Scan specifically for the Service UUID
-      // This is much more reliable than scanning everything and filtering by name
-      await FlutterBluePlus.startScan(
-        withServices: [Guid(SERVICE_UUID)], // ← Only detect matching UUID!
-        timeout: const Duration(minutes: 30),
-        androidUsesFineLocation: true,
+      final saved = await _rounds.process(
+        result.advertisementData.manufacturerData,
+        result.rssi,
       );
-
-      // Listen to scan results
-      _scanSubscription = FlutterBluePlus.scanResults.listen(
-        (results) {
-          print("📡 Scan results received: ${results.length} devices");
-          for (ScanResult r in results) {
-            _processScanResult(r);
-          }
-        },
-        onError: (e) {
-          print("❌ Scan error: $e");
-          _showError('Scan error: $e');
-        },
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('📡 Scanning for UUID: ${SERVICE_UUID.substring(0, 20)}...'),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
+      if (mounted && saved == DetectionResult.saved) {
+        setState(() => _devicesFound++);
       }
-    } catch (e) {
-      print("❌ Failed to start scanning: $e");
-      _showError('Failed to start scanning: $e');
-      setState(() => _isScanning = false);
+    } catch (error) {
+      _showError(
+        'Attendance not saved: $error. Resume and retry before completing.',
+      );
     }
   }
 
-  Future<void> _stopScanning() async {
+  Future<void> _stopScanning({bool cancel = false}) async {
+    if (_busy) return;
+    setState(() => _busy = true);
     try {
-      if (!_isScanning) return;
-      await FlutterBluePlus.stopScan();
-      setState(() => _isScanning = false);
-      
-      // Increment the scans_performed counter in Firestore when a round is stopped
-      await _sessionService.incrementScanRound(widget.sessionId);
-      
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Scan Round completed and saved.'),
-            backgroundColor: Colors.blue,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
-    } catch (e) {
-      // Ignore errors when stopping
-    }
-  }
-
-  void _processScanResult(ScanResult result) async {
-    try {
-      _devicesFound++;
-      
-      print("\n========================================");
-      print("📱 DEVICE DETECTED #$_devicesFound");
-      print("========================================");
-      
-      // Extract device information
-      String deviceName = result.device.platformName;
-      if (deviceName.isEmpty && result.advertisementData.advName.isNotEmpty) {
-        deviceName = result.advertisementData.advName;
-      }
-      String deviceId = result.device.remoteId.toString();
-      
-      print("📋 Device Info:");
-      print("   Name: $deviceName");
-      print("   ID: $deviceId");
-      print("   RSSI: ${result.rssi} dBm");
-      
-      // Debug: Print service UUIDs
-      print("📡 Advertised Services:");
-      if (result.advertisementData.serviceUuids.isEmpty) {
-        print("   (None found - this shouldn't happen if UUID filter works)");
-      } else {
-        for (var uuid in result.advertisementData.serviceUuids) {
-          print("   - $uuid");
-        }
-      }
-      
-      // Extract registration number from manufacturer data (secure method)
-      final Map<int, List<int>> manufacturerDataMap =
-          result.advertisementData.manufacturerData;
-
-      print("🔒 Checking manufacturer data...");
-      print("   Available Company IDs: ${manufacturerDataMap.keys.toList()}");
-
-      if (!manufacturerDataMap.containsKey(0xFFFF)) {
-        print("⚠️  Device missing manufacturer data with Company ID 0xFFFF - SKIPPED");
-        print("========================================");
-        return;
-      }
-
-      final List<int> regNoBytesList = manufacturerDataMap[0xFFFF]!;
-
-      print("📦 Manufacturer Data Found:");
-      print("   Company ID: 0xFFFF (Unreserved)");
-      print("   Data Length: ${regNoBytesList.length} bytes");
-      print("   Raw Bytes: $regNoBytesList");
-
-      String regNo;
-      try {
-        regNo = String.fromCharCodes(regNoBytesList).replaceAll('\x00', '').trim();
-      } catch (e) {
-        print("❌ Failed to decode manufacturer data: $e");
-        print("========================================");
-        return;
-      }
-
-      print("🎓 Processing Student:");
-      print("   RegNo extracted: $regNo");
-
-      // Check if already marked IN THIS ROUND
-      if (_scannedInCurrentRound.contains(regNo)) {
-        print("⏭️  Already marked in current round - skipping");
-        print("========================================");
-        return;
-      }
-      
-      // Filter unregistered students
-      if (_enrolledRegNos != null && !_enrolledRegNos!.contains(regNo)) {
-        print("⛔ Unregistered student detected - ignoring: $regNo");
-        print("========================================");
-        return;
-      }
-      
-      _scannedInCurrentRound.add(regNo);
-
-      // Verify student exists in Firestore
-      print("🔍 Querying Firebase for student: $regNo");
-      final studentQuery = await _firestore
-          .collection('students')
-          .where('reg_no', isEqualTo: regNo)
-          .limit(1)
-          .get();
-
-      if (studentQuery.docs.isEmpty) {
-        print("❌ Student not found in database for reg_no: $regNo");
-        print("========================================");
-        return;
-      }
-
-      final studentDoc = studentQuery.docs.first;
-      final studentData = studentDoc.data();
-      
-      print("✅ Student verified in Firebase:");
-      print("   Name: ${studentData['name'] ?? 'N/A'}");
-      print("   Email: ${studentData['email'] ?? 'N/A'}");
-
-      // Mark attendance
-      print("💾 Marking attendance...");
-      await _sessionService.markAttendance(
-        sessionId: widget.sessionId,
-        studentId: studentDoc.id,
-        regNo: regNo,
-        rssi: result.rssi,
-      );
-      
-      print("✅ Attendance marked successfully!");
-      print("========================================");
-
-      // Show notification
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('✅ ${studentData['name'] ?? regNo.toUpperCase()} marked present'),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 2),
-          ),
-        );
-      }
-    } catch (e) {
-      print("❌ Error processing scan result: $e");
-      print("========================================");
+      _rounds.gate.pause();
+      await _bindings.stopRadio();
+      await _scanSubscription?.cancel();
+      if (!mounted) return;
+      if (mounted) setState(() => _isScanning = false);
+      _rounds.currentRound ??= _sessionData['active_round_id'] as String?;
+      await _rounds.complete(cancel: cancel);
+    } catch (error) {
+      _showError('Round not completed: $error');
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
@@ -347,50 +168,70 @@ class _ScannerScreenState extends State<ScannerScreen> {
   }
 
   Future<void> _endSession() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1D1E33),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text(
-          'End Session',
-          style: TextStyle(color: Colors.white),
-        ),
-        content: Text(
-          'Are you sure you want to end this session?\n\n${_detectedStudents.length} students marked present.',
-          style: const TextStyle(color: Colors.grey),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: Text(
-              'Cancel',
-              style: TextStyle(color: Colors.grey.shade400),
-            ),
+    if (_unavailable) return;
+    setState(() => _ending = true);
+    try {
+      final confirm = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          backgroundColor: const Color(0xFF1D1E33),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
           ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade600,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
+          title: const Text(
+            'End Session',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: Text(
+            'Are you sure you want to end this session?\n\n${_detectedStudents.length} students marked present.',
+            style: const TextStyle(color: Colors.grey),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text(
+                'Cancel',
+                style: TextStyle(color: Colors.grey.shade400),
               ),
             ),
-            child: const Text(
-              'End Session',
-              style: TextStyle(color: Colors.white),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red.shade600,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              child: const Text(
+                'End Session',
+                style: TextStyle(color: Colors.white),
+              ),
             ),
-          ),
-        ],
-      ),
-    );
+          ],
+        ),
+      );
 
-    if (confirm == true) {
-      await _stopScanning();
-      await _sessionService.endSession(widget.sessionId);
-      if (mounted) {
-        Navigator.of(context).pop();
+      if (!mounted) return;
+      if (confirm == true) {
+        if (_isScanning ||
+            _rounds.currentRound != null ||
+            _sessionData['active_round_id'] != null) {
+          await _stopScanning();
+        }
+        if (_rounds.currentRound != null) return;
+        try {
+          if (!mounted) return;
+          await _bindings.endSession();
+        } catch (error) {
+          _showError('Session not completed: $error');
+          return;
+        }
+        if (mounted) {
+          Navigator.of(context).pop();
+        }
       }
+    } finally {
+      if (mounted) setState(() => _ending = false);
     }
   }
 
@@ -403,25 +244,32 @@ class _ScannerScreenState extends State<ScannerScreen> {
         elevation: 0,
         title: const Text(
           'Live Scanner',
-          style: TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.bold,
-          ),
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
         ),
       ),
       body: SafeArea(
         child: Column(
           children: [
+            if (_sessionError != null)
+              Text(
+                _sessionError!,
+                style: const TextStyle(color: Colors.redAccent),
+              ),
+            if (_rounds.currentRound != null ||
+                _sessionData['active_round_id'] != null)
+              TextButton(
+                onPressed: _unavailable
+                    ? null
+                    : () => _stopScanning(cancel: true),
+                child: const Text('Cancel open round'),
+              ),
             // Session info card
             Container(
               margin: const EdgeInsets.all(16),
               padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
                 gradient: LinearGradient(
-                  colors: [
-                    Colors.purple.shade400,
-                    Colors.deepPurple.shade600,
-                  ],
+                  colors: [Colors.purple.shade400, Colors.deepPurple.shade600],
                 ),
                 borderRadius: BorderRadius.circular(16),
                 boxShadow: [
@@ -506,7 +354,10 @@ class _ScannerScreenState extends State<ScannerScreen> {
                                       height: 16,
                                       child: CircularProgressIndicator(
                                         strokeWidth: 2,
-                                        valueColor: AlwaysStoppedAnimation<Color>(Colors.orangeAccent),
+                                        valueColor:
+                                            AlwaysStoppedAnimation<Color>(
+                                              Colors.orangeAccent,
+                                            ),
                                       ),
                                     ),
                                   ),
@@ -527,11 +378,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        const Icon(
-                          Icons.people,
-                          color: Colors.white,
-                          size: 32,
-                        ),
+                        const Icon(Icons.people, color: Colors.white, size: 32),
                         const SizedBox(width: 12),
                         Text(
                           '${_detectedStudents.length}',
@@ -544,10 +391,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                         const SizedBox(width: 8),
                         const Text(
                           'Present',
-                          style: TextStyle(
-                            color: Colors.white70,
-                            fontSize: 16,
-                          ),
+                          style: TextStyle(color: Colors.white70, fontSize: 16),
                         ),
                       ],
                     ),
@@ -555,21 +399,33 @@ class _ScannerScreenState extends State<ScannerScreen> {
                 ],
               ),
             ),
-            
+
             // Scan Controls
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              padding: const EdgeInsets.symmetric(
+                horizontal: 16.0,
+                vertical: 8.0,
+              ),
               child: SizedBox(
                 width: double.infinity,
                 height: 50,
                 child: ElevatedButton.icon(
-                  onPressed: _isScanning ? _stopScanning : _startScanning,
+                  onPressed: _unavailable
+                      ? null
+                      : _isScanning
+                      ? () => _stopScanning()
+                      : _startScanning,
                   icon: Icon(
                     _isScanning ? Icons.stop_circle_outlined : Icons.radar,
                     color: Colors.white,
                   ),
                   label: Text(
-                    _isScanning ? 'Stop Current Scan Round' : 'Start New Scan Round',
+                    _isScanning
+                        ? 'Complete Scan Round'
+                        : (_rounds.currentRound != null ||
+                                  _sessionData['active_round_id'] != null
+                              ? 'Resume Scan Round'
+                              : 'Start New Scan Round'),
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 16,
@@ -577,7 +433,9 @@ class _ScannerScreenState extends State<ScannerScreen> {
                     ),
                   ),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: _isScanning ? Colors.orange.shade700 : Colors.blue.shade600,
+                    backgroundColor: _isScanning
+                        ? Colors.orange.shade700
+                        : Colors.blue.shade600,
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12),
                     ),
@@ -666,8 +524,14 @@ class _ScannerScreenState extends State<ScannerScreen> {
                                           ...List.generate(
                                             data['scan_count'] ?? 1,
                                             (index) => const Padding(
-                                              padding: EdgeInsets.only(right: 2.0),
-                                              child: Icon(Icons.star, color: Colors.amber, size: 14),
+                                              padding: EdgeInsets.only(
+                                                right: 2.0,
+                                              ),
+                                              child: Icon(
+                                                Icons.star,
+                                                color: Colors.amber,
+                                                size: 14,
+                                              ),
                                             ),
                                           ),
                                           const SizedBox(width: 8),
@@ -736,7 +600,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                 width: double.infinity,
                 height: 56,
                 child: ElevatedButton(
-                  onPressed: _endSession,
+                  onPressed: _unavailable ? null : _endSession,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.red.shade600,
                     shape: RoundedRectangleBorder(

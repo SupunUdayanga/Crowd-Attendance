@@ -1,0 +1,67 @@
+const { spawn } = require('node:child_process');
+const path = require('node:path');
+const fs = require('node:fs');
+const { qaEnvironment } = require('./environment.cjs');
+
+const root = path.resolve(__dirname, '../..');
+const qaDir = path.join(root, 'qa');
+const configured = qaEnvironment();
+// Firebase's debug log can include the child environment. Pass only OS/runtime
+// requirements and explicit QA selectors, never ambient tokens or credentials.
+const allowed = /^(PATH|PATHEXT|SYSTEMROOT|WINDIR|COMSPEC|TEMP|TMP|USERPROFILE|HOME|APPDATA|LOCALAPPDATA|PROGRAMDATA|JAVA_HOME|ANDROID_HOME|ANDROID_SDK_ROOT|GRADLE_OPTS|QA_FLUTTER_BIN|QA_ANDROID_SERIAL|LANG|LC_ALL|QA_MODE|GCLOUD_PROJECT|GOOGLE_CLOUD_PROJECT|FIREBASE_PROJECT_ID|FIREBASE_AUTH_EMULATOR_HOST|FIRESTORE_EMULATOR_HOST|VITE_QA_MODE|VITE_QA_PROJECT_ID|VITE_QA_HOST|VITE_API_BASE_URL|FIREBASE_CLI_DISABLE_UPDATE_CHECK)$/i;
+const env = Object.fromEntries(Object.entries(configured).filter(([key]) => allowed.test(key)));
+// Firebase emulators:exec uses a shell command containing "node". Resolve it
+// to the same runtime as this launcher, even when another Node is on PATH.
+const inheritedPath = Object.entries(env).find(([key]) => key.toUpperCase() === 'PATH')?.[1] || '';
+for (const key of Object.keys(env)) if (key.toUpperCase() === 'PATH') delete env[key];
+env.PATH = path.dirname(process.execPath) + path.delimiter + inheritedPath;
+// Firebase emulator downloads stay in this workspace, not a global cache.
+env.FIREBASE_EMULATORS_PATH = path.join(qaDir, '.cache/emulators');
+env.XDG_CONFIG_HOME = path.join(qaDir, '.cache/config'); // Isolate CLI login/preferences too.
+env.CI = 'true'; // Noninteractive CLI; skip remote MOTD/update checks.
+env.PLAYWRIGHT_BROWSERS_PATH = path.join(qaDir, '.cache/playwright');
+if (['emulators', 'smoke', 'security', 'access', 'rounds', 'finalization', 'reports', 'components', 'p10-security', 'p10-load', 'p11-node','p11-browser','p11-mobile'].includes(process.argv[2])) {
+  // Firebase requires rules inside its config root. Refresh from the actual
+  // application rules on EVERY launch; never maintain permissive QA rules.
+  fs.mkdirSync(path.join(qaDir, '.cache'), { recursive: true });
+  fs.copyFileSync(path.join(root, 'web_app/admin-portal/firestore.rules'), path.join(qaDir, '.cache/firestore.rules'));
+}
+const firebaseCli = path.join(qaDir, 'node_modules/firebase-tools/lib/bin/firebase.js');
+const viteCli = path.join(root, 'web_app/admin-portal/frontend/node_modules/vite/bin/vite.js');
+const common = ['--config', path.join(qaDir, 'firebase.qa.json'), '--project', env.GCLOUD_PROJECT, '--only', 'auth,firestore'];
+const actions = {
+  'p11-node': { args: [firebaseCli, 'emulators:exec', ...common, `node scripts/suites.cjs inner-${process.argv[3]}`] },
+  'p11-browser': { args: [firebaseCli, 'emulators:exec', ...common, `node scripts/browser.cjs ${process.argv[3]}`] },
+  'p11-mobile': { args: [firebaseCli, 'emulators:exec', ...common, `node scripts/mobile.cjs ${process.argv[3]}`] },
+  'p10-security': { args: [firebaseCli, 'emulators:exec', ...common, 'node security/run.cjs'] },
+  'p10-load': { args: [firebaseCli, 'emulators:exec', ...common, 'node load/run.cjs'] },
+  'browser-tests': { args: [path.join(qaDir, 'node_modules/@playwright/test/cli.js'), 'test', ...process.argv.slice(3)] },
+  'p09-student-fixture': { args: [path.join(__dirname, 'p09-student-fixture.cjs')] },
+  components: { args: [firebaseCli, 'emulators:exec', ...common, 'node scripts/p08.cjs'] },
+  emulators: { args: [firebaseCli, 'emulators:start', ...common] },
+  smoke: { args: [firebaseCli, 'emulators:exec', ...common, 'node scripts/smoke.cjs'] },
+  security: { args: [firebaseCli, 'emulators:exec', ...common, 'node scripts/smoke.cjs security'] },
+  access: { args: [firebaseCli, 'emulators:exec', ...common, 'node scripts/smoke.cjs access'] },
+  rounds: { args: [firebaseCli, 'emulators:exec', ...common, 'node scripts/smoke.cjs rounds'] },
+  finalization: { args: [firebaseCli, 'emulators:exec', ...common, 'node scripts/smoke.cjs finalization'] },
+  'round-rules': { args: ['--test', 'tests/round-security.test.cjs'] },
+  'finalization-tests': { args: ['--test', 'tests/finalization.test.cjs'] },
+  'report-tests': { args: ['--test', '--test-concurrency=1', 'tests/report-policy.test.cjs', 'tests/workbook.test.cjs', 'tests/report.test.cjs'] },
+  reports: { args: [firebaseCli, 'emulators:exec', ...common, 'node scripts/smoke.cjs reports'] },
+  'p07-fixture': { args: [path.join(__dirname, 'p07-mobile-fixture.cjs')] },
+  seed: { args: [path.join(__dirname, 'fixtures.cjs'), 'seed'] },
+  'p04-fixture': { args: [path.join(__dirname, 'p04-mobile-fixture.cjs')] },
+  reset: { args: [path.join(__dirname, 'fixtures.cjs'), 'reset'] },
+  api: { args: [path.join(root, 'web_app/admin-portal/server/index.js')] },
+  web: { args: [viteCli, '--mode', 'qa', '--host', '127.0.0.1'], cwd: path.join(root, 'web_app/admin-portal/frontend') },
+  'build-web': { args: [viteCli, 'build', '--mode', 'qa'], cwd: path.join(root, 'web_app/admin-portal/frontend') },
+  'component-tests': { args: [path.join(root, 'web_app/admin-portal/frontend/node_modules/vitest/vitest.mjs'), 'run', '--config', 'vitest.config.js'], cwd: path.join(root, 'web_app/admin-portal/frontend') },
+  'component-integration': { args: [path.join(root, 'web_app/admin-portal/frontend/node_modules/vitest/vitest.mjs'), 'run', '--config', 'vitest.integration.config.js', '--mode', 'qa'], cwd: path.join(root, 'web_app/admin-portal/frontend') },
+};
+const action = actions[process.argv[2]];
+const p11Categories={'p11-node':['api','rules','rounds','integration'],'p11-browser':['accessibility','visual'],'p11-mobile':['widget','mobile','e2e']};
+if (process.argv[2]?.startsWith('p11-') && (!p11Categories[process.argv[2]]?.includes(process.argv[3]) || process.argv.length !== 4)) throw Error('One fixed P11 category is required');
+if (!action) throw new Error(`Expected one of: ${Object.keys(actions).join(', ')}`);
+const child = spawn(process.execPath, action.args, { cwd: action.cwd || qaDir, env, stdio: 'inherit', windowsHide: true });
+child.on('error', error => { console.error(error.message); process.exitCode = 1; });
+child.on('exit', code => { process.exitCode = code ?? 1; });

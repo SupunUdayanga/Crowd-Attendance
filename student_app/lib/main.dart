@@ -1,6 +1,7 @@
+import 'package:student_app/services/firebase_environment.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:firebase_core/firebase_core.dart';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
@@ -20,7 +21,7 @@ import 'screens/modules_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
+  await initializeAppFirebase();
 
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
@@ -132,7 +133,7 @@ class AuthWrapper extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
+      stream: appAuth.authStateChanges(),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
@@ -160,7 +161,8 @@ class AuthWrapper extends StatelessWidget {
 // ============================================================================
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  const LoginScreen({super.key, this.login});
+  final Future<void> Function(String email, String password)? login;
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -190,13 +192,21 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _handleLogin() async {
+    if (_isLoading) return;
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _isLoading = true);
 
     try {
+      if (widget.login != null) {
+        await widget.login!(
+          _emailController.text.trim(),
+          _passwordController.text.trim(),
+        );
+        return;
+      }
       // Step 1: Authenticate with Firebase Auth
-      final userCredential = await FirebaseAuth.instance
+      final userCredential = await appAuth
           .signInWithEmailAndPassword(
             email: _emailController.text.trim(),
             password: _passwordController.text.trim(),
@@ -207,15 +217,13 @@ class _LoginScreenState extends State<LoginScreen> {
       final currentDeviceId = await _getDeviceId();
 
       // Step 2: Check Firestore for device binding
-      final studentRef = FirebaseFirestore.instance
-          .collection('students')
-          .doc(uid);
-        final studentDoc = await studentRef
-          .get()
-          .timeout(const Duration(seconds: 20));
+      final studentRef = appFirestore.collection('students').doc(uid);
+      final studentDoc = await studentRef.get().timeout(
+        const Duration(seconds: 20),
+      );
 
       if (!studentDoc.exists) {
-        await FirebaseAuth.instance.signOut();
+        await appAuth.signOut();
         throw Exception('Student record not found. Contact administrator.');
       }
 
@@ -240,7 +248,7 @@ class _LoginScreenState extends State<LoginScreen> {
         }
       } else if (storedDeviceId != currentDeviceId.trim()) {
         // Device mismatch - BLOCK LOGIN
-        await FirebaseAuth.instance.signOut();
+        await appAuth.signOut();
         throw Exception(
           'Unauthorized Device\n\nThis account is locked to another device. '
           'Contact your administrator to reset device binding.',
@@ -257,7 +265,9 @@ class _LoginScreenState extends State<LoginScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('Login timed out. Check your connection and try again.'),
+            content: Text(
+              'Login timed out. Check your connection and try again.',
+            ),
             backgroundColor: Colors.red,
           ),
         );
@@ -535,7 +545,7 @@ class _BroadcastScreenState extends State<BroadcastScreen>
 
   Future<void> _loadStudentData() async {
     try {
-      final doc = await FirebaseFirestore.instance
+      final doc = await appFirestore
           .collection('students')
           .doc(widget.user.uid)
           .get();
@@ -722,7 +732,7 @@ class _BroadcastScreenState extends State<BroadcastScreen>
               if (_isBroadcasting) {
                 await _blePeripheral.stop();
               }
-              await FirebaseAuth.instance.signOut();
+              await appAuth.signOut();
             },
           ),
         ],
@@ -942,7 +952,9 @@ class _BroadcastScreenState extends State<BroadcastScreen>
   @override
   void dispose() {
     _pulseController.dispose();
-    _blePeripheral.stop();
+    // An idle screen must not invoke the radio plugin or request permissions
+    // when navigating away/logout. Native advertising is stopped only if used.
+    if (_isBroadcasting) _blePeripheral.stop();
     super.dispose();
   }
 }
