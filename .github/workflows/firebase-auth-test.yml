@@ -2,6 +2,9 @@
 name: Firebase Authentication Test
 
 on:
+  push:
+    branches:
+      - supun-branch
   workflow_dispatch:
 
 permissions:
