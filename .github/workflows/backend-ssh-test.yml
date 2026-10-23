@@ -1,0 +1,54 @@
+
+name: Backend Azure SSH Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-ssh:
+    name: Test Azure VM SSH Connection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure SSH Private Key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Add Verified Azure VM Host Key
+        env:
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+        run: |
+          printf '%s %s\n' "$AZURE_VM_HOST" \
+            'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILu6Wi9+JXH+fuGS1bbk7KDKXSNSPMp3cheM0aBdhdwb' \
+            > ~/.ssh/known_hosts
+
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh-keygen -lf ~/.ssh/known_hosts -E sha256 \
+            | grep -F 'SHA256:aEf0dLcrStHBlSNz9tMHgPWy++nT27mp0U0p46M3XJU'
+
+      - name: Test Azure SSH Connection
+        env:
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+          AZURE_VM_USER: ${{ vars.AZURE_VM_USER }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            "$AZURE_VM_USER@$AZURE_VM_HOST" \
+            "whoami && hostname"
+
+      - name: Verify SSH Connection Success
+        run: |
+          echo "Azure VM SSH connection successful!"
