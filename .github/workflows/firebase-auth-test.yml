@@ -1,0 +1,35 @@
+
+name: Firebase Authentication Test
+
+on:
+  push:
+    branches:
+      - supun-branch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test-auth:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Verify Authentication
+        run: |
+          gcloud auth list
+          gcloud config set project crowed-attendence
+          gcloud projects describe crowed-attendence --format="value(projectId)"

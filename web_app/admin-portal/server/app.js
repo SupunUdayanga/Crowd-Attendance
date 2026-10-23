@@ -9,7 +9,7 @@ function createApp() {
   if (!qa) app.use(morgan('combined'));
   app.use(cors({ origin: qa
     ? ['http://localhost:5173', 'http://127.0.0.1:5173']
-    : ['http://localhost:5173', 'https://crowed-attendence.web.app'] }));
+    : ['http://localhost:5173', 'https://crowed-attendence.web.app' , 'https://crowed-attendence--supun-preview-74lnzsnv.web.app'] }));
   app.use(express.json({ limit: '100kb' }));
   app.use('/api/auth', require('./routes/authRoutes'));
   app.use('/api', require('./routes/students'));

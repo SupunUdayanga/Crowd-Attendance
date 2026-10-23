@@ -48,7 +48,8 @@ app.*.map.json
 /android/app/release
 
 # Firebase (keep google-services.json but ignore firebase config)
-firebase.json
+# Firebase Hosting CI/CD configuration
+# firebase.json
 .firebaserc
 
 # Environment variables & secrets
