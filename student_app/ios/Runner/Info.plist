@@ -45,5 +45,12 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+
+	<!-- Bluetooth Permissions for BLE Peripheral Advertising -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Student App requires Bluetooth to broadcast attendance tokens to the lecturer.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Student App requires Bluetooth peripheral capabilities to announce your presence in class.</string>
+
 </dict>
 </plist>

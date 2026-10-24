@@ -1,0 +1,52 @@
+name: Build Student App (iOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - desh-branch
+    paths:
+      - 'student_app/**'
+      - '.github/workflows/build-student-ios.yml'
+
+jobs:
+  build-ios:
+    name: Build iOS IPA
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        working-directory: student_app
+        run: flutter pub get
+
+      - name: Build iOS Application (Unsigned)
+        working-directory: student_app
+        run: |
+          flutter build ios --release --no-codesign
+
+      - name: Package into IPA for Sideloading
+        working-directory: student_app
+        run: |
+          mkdir -p build/ios/iphoneos/Payload
+          cp -r build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
+          cd build/ios/iphoneos
+          zip -r student_app.ipa Payload
+          echo "IPA packaged successfully at student_app/build/ios/iphoneos/student_app.ipa"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: student_app_ios
+          path: student_app/build/ios/iphoneos/student_app.ipa
+          retention-days: 7

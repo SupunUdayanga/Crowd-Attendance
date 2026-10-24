@@ -562,7 +562,23 @@ class _BroadcastScreenState extends State<BroadcastScreen>
   }
 
   Future<bool> _requestPermissions() async {
-    try {
+  try {
+    if (Platform.isIOS) {
+      final status = await Permission.bluetooth.request();
+      if (!status.isGranted) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Bluetooth permission is required for attendance.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        return false;
+      }
+      return true;
+    } else {
+      // Android flow
       final permissions = [
         Permission.bluetoothAdvertise,
         Permission.bluetoothConnect,
@@ -586,11 +602,13 @@ class _BroadcastScreenState extends State<BroadcastScreen>
         }
       }
       return true;
-    } catch (e) {
-      print('❌ Permission error: $e');
-      return false;
     }
+  } catch (e) {
+    print('❌ Permission error: $e');
+    return false;
   }
+}
+
 
   Future<void> _toggleBroadcast() async {
     if (_regNo == null) {
@@ -628,11 +646,14 @@ class _BroadcastScreenState extends State<BroadcastScreen>
         );
 
         final advertiseData = AdvertiseData(
-          serviceUuid: SERVICE_UUID,
-          localName: "SJP", // Short name to save packet space
-          manufacturerId: 0xFFFF,
-          manufacturerData: manufacturerData,
-        );
+  serviceUuid: SERVICE_UUID,
+  // On iOS, CoreBluetooth only permits broadcasting the localName.
+  // On Android, "SJP" is kept and data is packed into manufacturerData.
+  localName: Platform.isIOS ? _regNo : "SJP",
+  manufacturerId: Platform.isIOS ? null : 0xFFFF,
+  manufacturerData: Platform.isIOS ? null : manufacturerData,
+);
+
 
         final advertiseSettings = AdvertiseSettings(
           advertiseMode: AdvertiseMode.advertiseModeBalanced,
