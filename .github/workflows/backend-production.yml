@@ -44,9 +44,57 @@ jobs:
       - name: Backend security audit
         run: npm audit --omit=dev --audit-level=high
 
+  rollback-test:
+    name: Test Release Rollback
+    needs: validate
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Simulate deployment and rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="$(mktemp -d)"
+          trap 'rm -rf "$BASE"' EXIT
+
+          mkdir -p "$BASE/releases/v1" "$BASE/releases/v2"
+
+          echo "v1" > "$BASE/releases/v1/version.txt"
+          echo "v2" > "$BASE/releases/v2/version.txt"
+
+          cd "$BASE"
+
+          # Set initial release
+          ln -s releases/v1 current
+
+          PREVIOUS="$(readlink current)"
+
+          test "$(cat current/version.txt)" = "v1"
+
+          echo "Initial release: v1"
+
+          # Simulate deploying v2
+          ln -s releases/v2 current.next
+          mv -Tf current.next current
+
+          test "$(cat current/version.txt)" = "v2"
+
+          echo "New release deployed: v2"
+
+          # Simulate rollback
+          ln -s "$PREVIOUS" current.next
+          mv -Tf current.next current
+
+          test "$(cat current/version.txt)" = "v1"
+
+          echo "Rollback restored: v1"
+          echo "Release switching and rollback simulation passed."
+
   production-gate:
     name: Production Approval Gate
-    needs: validate
+    needs: [validate, rollback-test]
+    if: github.ref == 'refs/heads/MAIN'
     runs-on: ubuntu-24.04
     environment: backend-production
 
@@ -54,6 +102,8 @@ jobs:
       - name: Confirm dry-run only
         run: |
           echo "Backend production validation completed."
+          echo "Rollback simulation passed."
+          echo "Production approval gate completed."
           echo "DRY RUN ONLY."
           echo "No files transferred to Azure."
           echo "No PM2 restart."
