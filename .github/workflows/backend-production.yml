@@ -64,31 +64,21 @@ jobs:
           echo "v2" > "$BASE/releases/v2/version.txt"
 
           cd "$BASE"
-
-          # Set initial release
           ln -s releases/v1 current
-
           PREVIOUS="$(readlink current)"
 
           test "$(cat current/version.txt)" = "v1"
 
-          echo "Initial release: v1"
-
-          # Simulate deploying v2
           ln -s releases/v2 current.next
           mv -Tf current.next current
 
           test "$(cat current/version.txt)" = "v2"
 
-          echo "New release deployed: v2"
-
-          # Simulate rollback
           ln -s "$PREVIOUS" current.next
           mv -Tf current.next current
 
           test "$(cat current/version.txt)" = "v1"
 
-          echo "Rollback restored: v1"
           echo "Release switching and rollback simulation passed."
 
   production-gate:
@@ -99,13 +89,64 @@ jobs:
     environment: backend-production
 
     steps:
-      - name: Confirm dry-run only
+      - name: Confirm approval gate
         run: |
-          echo "Backend production validation completed."
-          echo "Rollback simulation passed."
           echo "Production approval gate completed."
+          echo "DRY RUN ONLY. Production deployment is disabled."
+
+  azure-readiness:
+    name: Azure Production Readiness Dry Run
+    needs: production-gate
+    if: github.ref == 'refs/heads/MAIN'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Configure verified SSH connection
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          printf '%s %s\n' "$AZURE_VM_HOST" \
+            'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILu6Wi9+JXH+fuGS1bbk7KDKXSNSPMp3cheM0aBdhdwb' \
+            > ~/.ssh/known_hosts
+
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh-keygen -lf ~/.ssh/known_hosts -E sha256 \
+            | grep -F 'SHA256:aEf0dLcrStHBlSNz9tMHgPWy++nT27mp0U0p46M3XJU'
+
+      - name: Run Azure deployment readiness check
+        env:
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+          AZURE_VM_USER: ${{ vars.AZURE_VM_USER }}
+        run: |
+          set -euo pipefail
+
+          ssh -o BatchMode=yes \
+            "$AZURE_VM_USER@$AZURE_VM_HOST" \
+            'set -eu
+             TOOLS="$HOME/backend-release-tools"
+
+             test -f "$TOOLS/deploy.conf"
+             test -x "$TOOLS/deploy.sh"
+
+             grep -Eq "^DRY_RUN=true$" "$TOOLS/deploy.conf"
+
+             "$TOOLS/deploy.sh"
+            '
+
+      - name: Confirm production remains disabled
+        run: |
+          echo "Azure readiness validation completed."
           echo "DRY RUN ONLY."
-          echo "No files transferred to Azure."
+          echo "No release switched."
           echo "No PM2 restart."
-          echo "No live deployment."
-          echo "Production release remains disabled."
+          echo "No production deployment."
