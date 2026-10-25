@@ -1,0 +1,61 @@
+
+name: Backend Azure Production Deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Production Backend
+    if: github.ref == 'refs/heads/MAIN'
+    runs-on: ubuntu-24.04
+
+    defaults:
+      run:
+        working-directory: web_app/admin-portal/server
+
+    steps:
+      - name: Checkout MAIN
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web_app/admin-portal/server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check backend syntax
+        run: |
+          node --check index.js
+          node --check app.js
+          node --check firebaseAdmin.js
+
+      - name: Backend security audit
+        run: npm audit --omit=dev --audit-level=high
+
+  production-gate:
+    name: Production Approval Gate
+    needs: validate
+    runs-on: ubuntu-24.04
+    environment: backend-production
+
+    steps:
+      - name: Confirm dry-run only
+        run: |
+          echo "Backend production validation completed."
+          echo "DRY RUN ONLY."
+          echo "No files transferred to Azure."
+          echo "No PM2 restart."
+          echo "No live deployment."
+          echo "Production release remains disabled."
