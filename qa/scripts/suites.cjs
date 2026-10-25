@@ -13,7 +13,15 @@ const groups = {
   rounds: ['round-security', 'finalization'].map(f => `tests/${f}.test.cjs`),
   integration: ['emulator', 'report'].map(f => `tests/${f}.test.cjs`),
 };
-const flutter = process.env.QA_FLUTTER_BIN || (process.platform === 'win32' ? (fs.existsSync('C:/sdk/flutter/bin/flutter.bat')?'C:/sdk/flutter/bin/flutter.bat':'flutter.bat') : 'flutter');
+const flutter = process.env.QA_FLUTTER_BIN ||
+  (process.platform === 'win32'
+    ? path.join(
+        process.env.FLUTTER_ROOT ||
+          path.resolve(process.env.USERPROFILE || '', 'flutter'),
+        'bin',
+        'flutter.bat'
+      )
+    : 'flutter');
 const defines = ['--dart-define=QA_MODE=true','--dart-define=QA_PROJECT_ID=demo-crowd-attendance-qa','--dart-define=QA_EMULATOR_HOST=10.0.2.2'];
 async function flutterCall(label, app, args, tests) { return command(label, flutter, args, { cwd: path.join(root, app), tests }); }
 async function readiness() {
