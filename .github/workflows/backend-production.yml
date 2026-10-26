@@ -22,8 +22,10 @@ jobs:
         working-directory: web_app/admin-portal/server
 
     steps:
-      - name: Checkout MAIN
+      - name: Checkout approved commit
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -40,6 +42,19 @@ jobs:
           node --check index.js
           node --check app.js
           node --check firebaseAdmin.js
+
+      - name: Verify health endpoint exists
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const app = fs.readFileSync('app.js', 'utf8');
+
+          if (!app.includes("app.get('/health'")) {
+            throw new Error('Production health endpoint missing');
+          }
+
+          console.log('Health endpoint source: PASS');
+          NODE
 
       - name: Backend security audit
         run: npm audit --omit=dev --audit-level=high
@@ -64,6 +79,7 @@ jobs:
           echo "v2" > "$BASE/releases/v2/version.txt"
 
           cd "$BASE"
+
           ln -s releases/v1 current
           PREVIOUS="$(readlink current)"
 
@@ -79,7 +95,7 @@ jobs:
 
           test "$(cat current/version.txt)" = "v1"
 
-          echo "Release switching and rollback simulation passed."
+          echo "Rollback simulation: PASS"
 
   production-gate:
     name: Production Approval Gate
@@ -89,30 +105,39 @@ jobs:
     environment: backend-production
 
     steps:
-      - name: Confirm approval gate
+      - name: Confirm approval
         run: |
-          echo "Production approval gate completed."
-          echo "DRY RUN ONLY. Production deployment is disabled."
+          echo "Production approval gate: PASS"
+          echo "Running Azure production readiness checks."
+          echo "Live deployment remains disabled."
 
   azure-readiness:
-    name: Azure Production Readiness Dry Run
+    name: Azure Green Production Readiness
     needs: production-gate
     if: github.ref == 'refs/heads/MAIN'
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Configure verified SSH connection
+      - name: Checkout approved commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure verified SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
           AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
         run: |
           set -euo pipefail
 
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$AZURE_VM_HOST"
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_azure
+          chmod 600 ~/.ssh/id_azure
 
           printf '%s %s\n' "$AZURE_VM_HOST" \
             'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILu6Wi9+JXH+fuGS1bbk7KDKXSNSPMp3cheM0aBdhdwb' \
@@ -123,75 +148,173 @@ jobs:
           ssh-keygen -lf ~/.ssh/known_hosts -E sha256 \
             | grep -F 'SHA256:aEf0dLcrStHBlSNz9tMHgPWy++nT27mp0U0p46M3XJU'
 
-      - name: Check Blue and Green Backend Health
+      - name: Verify approved release and production readiness
         env:
           AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
           AZURE_VM_USER: ${{ vars.AZURE_VM_USER }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          ssh -o BatchMode=yes \
+          SERVER="web_app/admin-portal/server"
+
+          SOURCE_DIGEST="$(
+            cd "$SERVER"
+            sha256sum \
+              app.js \
+              index.js \
+              firebaseAdmin.js \
+              qaConfig.js \
+              package-lock.json \
+            | sha256sum | awk '{print $1}'
+          )"
+
+          ssh -i ~/.ssh/id_azure \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
             "$AZURE_VM_USER@$AZURE_VM_HOST" \
-            'bash -se' <<'REMOTE'
+            bash -se -- "$SOURCE_DIGEST" <<'REMOTE'
           set -euo pipefail
 
-          echo "Checking Blue Production Backend..."
+          EXPECTED_DIGEST="$1"
+          CANDIDATE="$HOME/backend-releases/candidate-03"
+          TOOLS="$HOME/backend-release-tools"
 
-          pm2 describe crowd-attendance-api \
-            | grep -Eq 'status[[:space:]]+│[[:space:]]+online'
+          echo "=== Verify candidate source ==="
 
-          echo "Blue Backend PM2: ONLINE"
+          cd "$CANDIDATE"
 
-          echo "Checking Green QA Backend..."
+          ACTUAL_DIGEST="$(
+            sha256sum \
+              app.js \
+              index.js \
+              firebaseAdmin.js \
+              qaConfig.js \
+              package-lock.json \
+            | sha256sum | awk '{print $1}'
+          )"
 
-          pm2 describe crowd-attendance-green \
-            | grep -Eq 'status[[:space:]]+│[[:space:]]+online'
+          if [[ "$ACTUAL_DIGEST" != "$EXPECTED_DIGEST" ]]; then
+            echo "BLOCKED: Azure candidate differs from approved GitHub commit"
+            exit 1
+          fi
 
-          echo "Green Backend PM2: ONLINE"
+          echo "Candidate source verification: PASS"
 
-          echo "Checking Green HTTP health..."
+          echo "=== Check PM2 processes ==="
 
-          RESPONSE="$(curl --fail --silent --show-error \
-            --max-time 10 \
-            http://127.0.0.1:5002/health)"
+          pm2 jlist | node -e '
+          let input = "";
+          process.stdin.on("data", c => input += c);
+          process.stdin.on("end", () => {
+            const apps = JSON.parse(input);
 
-          printf '%s\n' "$RESPONSE" \
-            | grep -Fq '"status":"ok"'
+            const blue = apps.find(
+              a => a.name === "crowd-attendance-api"
+            );
 
-          printf '%s\n' "$RESPONSE" \
-            | grep -Fq '"service":"crowd-attendance-backend"'
+            const green = apps.find(
+              a => a.name === "crowd-attendance-green-production"
+            );
 
-          echo "Green Backend Health: PASSED"
-          echo "Blue-Green Readiness: PASSED"
-          echo "QA MODE ONLY — Not approved for production traffic."
+            if (!blue || blue.pm2_env.status !== "online") {
+              console.error("BLOCKED: Blue backend unavailable");
+              process.exit(1);
+            }
+
+            if (!green || green.pm2_env.status !== "online") {
+              console.error("BLOCKED: Green backend unavailable");
+              process.exit(1);
+            }
+
+            const env = green.pm2_env;
+
+            if (String(env.PORT) !== "5003") {
+              console.error("BLOCKED: Wrong Green port");
+              process.exit(1);
+            }
+
+            if (
+              !String(env.pm_cwd || "").endsWith(
+                "/backend-releases/candidate-03"
+              )
+            ) {
+              console.error("BLOCKED: Wrong Green release");
+              process.exit(1);
+            }
+
+            const forbidden = [
+              "FIRESTORE_EMULATOR_HOST",
+              "FIREBASE_AUTH_EMULATOR_HOST",
+              "GCLOUD_EMULATOR_HOST"
+            ];
+
+            if (
+              env.QA_MODE === "true" ||
+              forbidden.some(key => Boolean(env[key]))
+            ) {
+              console.error("BLOCKED: QA emulator configuration");
+              process.exit(1);
+            }
+
+            console.log("Blue Production: ONLINE");
+            console.log("Green Production: ONLINE");
+            console.log("Production isolation: PASS");
+          });
+          '
+
+          echo "=== Check Green health ==="
+
+          RESPONSE="$(
+            curl -fsS --max-time 10 \
+              http://127.0.0.1:5003/health
+          )"
+
+          printf '%s' "$RESPONSE" | node -e '
+          let input = "";
+          process.stdin.on("data", c => input += c);
+          process.stdin.on("end", () => {
+            const health = JSON.parse(input);
+
+            if (
+              health.status !== "ok" ||
+              health.service !== "crowd-attendance-backend"
+            ) {
+              process.exit(1);
+            }
+
+            console.log("Green Health: PASS");
+          });
+          '
+
+          echo "=== Check Nginx ==="
+
+          sudo -n nginx -t
+
+          SITE="/etc/nginx/sites-enabled/crowd-attendance"
+
+          test "$(
+            sudo -n grep -Fc \
+              'proxy_pass http://127.0.0.1:5000;' "$SITE"
+          )" -eq 1
+
+          echo "Production still on Blue: PASS"
+
+          echo "=== Switch readiness dry run ==="
+
+          bash -n "$TOOLS/switch-green-03.sh"
+
+          "$TOOLS/switch-green-03.sh" --dry-run
+
+          echo "Azure Production Readiness: PASS"
           REMOTE
 
-      - name: Run Azure deployment readiness check
-        env:
-          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
-          AZURE_VM_USER: ${{ vars.AZURE_VM_USER }}
+      - name: Confirm deployment remains disabled
         run: |
-          set -euo pipefail
-
-          ssh -o BatchMode=yes \
-            "$AZURE_VM_USER@$AZURE_VM_HOST" \
-            'set -eu
-             TOOLS="$HOME/backend-release-tools"
-
-             test -f "$TOOLS/deploy.conf"
-             test -x "$TOOLS/deploy.sh"
-
-             grep -Eq "^DRY_RUN=true$" "$TOOLS/deploy.conf"
-
-             "$TOOLS/deploy.sh"
-            '
-
-      - name: Confirm production remains disabled
-        run: |
-          echo "Azure readiness validation completed."
-          echo "Blue and Green backend checks completed."
-          echo "DRY RUN ONLY."
-          echo "No release switched."
-          echo "No Nginx reload."
-          echo "No PM2 restart."
-          echo "No production deployment."
+          echo "================================"
+          echo "AZURE READINESS: PASSED"
+          echo "Approved source validated."
+          echo "Green Production health validated."
+          echo "Rollback readiness dry-run validated."
+          echo "NO LIVE SWITCH EXECUTED."
+          echo "================================"
