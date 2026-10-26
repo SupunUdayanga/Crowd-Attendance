@@ -112,7 +112,7 @@ jobs:
           echo "Live deployment remains disabled."
 
   azure-readiness:
-    name: Azure Green Production Readiness
+    name: Azure Production Release Readiness
     needs: production-gate
     if: github.ref == 'refs/heads/MAIN'
     runs-on: ubuntu-24.04
@@ -127,6 +127,7 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
           AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -166,7 +167,7 @@ jobs:
               firebaseAdmin.js \
               qaConfig.js \
               package-lock.json \
-            | sha256sum | awk '{print $1}'
+              | sha256sum | awk '{print $1}'
           )"
 
           ssh -i ~/.ssh/id_azure \
@@ -178,9 +179,8 @@ jobs:
 
           EXPECTED_DIGEST="$1"
           CANDIDATE="$HOME/backend-releases/candidate-03"
-          TOOLS="$HOME/backend-release-tools"
 
-          echo "=== Verify candidate source ==="
+          echo "=== Verify approved source ==="
 
           cd "$CANDIDATE"
 
@@ -191,30 +191,32 @@ jobs:
               firebaseAdmin.js \
               qaConfig.js \
               package-lock.json \
-            | sha256sum | awk '{print $1}'
+              | sha256sum | awk '{print $1}'
           )"
 
           if [[ "$ACTUAL_DIGEST" != "$EXPECTED_DIGEST" ]]; then
-            echo "BLOCKED: Azure candidate differs from approved GitHub commit"
+            echo "BLOCKED: Azure candidate differs from GitHub commit"
             exit 1
           fi
 
           echo "Candidate source verification: PASS"
 
-          echo "=== Check PM2 processes ==="
+          echo "=== Verify PM2 Green production ==="
 
           pm2 jlist | node -e '
           let input = "";
-          process.stdin.on("data", c => input += c);
+
+          process.stdin.on("data", chunk => input += chunk);
+
           process.stdin.on("end", () => {
             const apps = JSON.parse(input);
 
             const blue = apps.find(
-              a => a.name === "crowd-attendance-api"
+              app => app.name === "crowd-attendance-api"
             );
 
             const green = apps.find(
-              a => a.name === "crowd-attendance-green-production"
+              app => app.name === "crowd-attendance-green-production"
             );
 
             if (!blue || blue.pm2_env.status !== "online") {
@@ -229,15 +231,10 @@ jobs:
 
             const env = green.pm2_env;
 
-            if (String(env.PORT) !== "5003") {
-              console.error("BLOCKED: Wrong Green port");
-              process.exit(1);
-            }
-
             if (
-              !String(env.pm_cwd || "").endsWith(
-                "/backend-releases/candidate-03"
-              )
+              String(env.PORT) !== "5003" ||
+              env.pm_cwd !==
+                "/home/azureuser/backend-releases/candidate-03"
             ) {
               console.error("BLOCKED: Wrong Green release");
               process.exit(1);
@@ -253,26 +250,25 @@ jobs:
               env.QA_MODE === "true" ||
               forbidden.some(key => Boolean(env[key]))
             ) {
-              console.error("BLOCKED: QA emulator configuration");
+              console.error("BLOCKED: QA emulator detected");
               process.exit(1);
             }
 
-            console.log("Blue Production: ONLINE");
-            console.log("Green Production: ONLINE");
+            console.log("Blue rollback backend: ONLINE");
+            console.log("Green production backend: ONLINE");
             console.log("Production isolation: PASS");
           });
           '
 
-          echo "=== Check Green health ==="
+          echo "=== Green health ==="
 
-          RESPONSE="$(
-            curl -fsS --max-time 10 \
-              http://127.0.0.1:5003/health
-          )"
-
-          printf '%s' "$RESPONSE" | node -e '
+          curl -fsS --max-time 10 \
+            http://127.0.0.1:5003/health \
+            | node -e '
           let input = "";
-          process.stdin.on("data", c => input += c);
+
+          process.stdin.on("data", chunk => input += chunk);
+
           process.stdin.on("end", () => {
             const health = JSON.parse(input);
 
@@ -283,11 +279,11 @@ jobs:
               process.exit(1);
             }
 
-            console.log("Green Health: PASS");
+            console.log("Green backend health: PASS");
           });
           '
 
-          echo "=== Check Nginx ==="
+          echo "=== Nginx production ==="
 
           sudo -n nginx -t
 
@@ -295,26 +291,59 @@ jobs:
 
           test "$(
             sudo -n grep -Fc \
-              'proxy_pass http://127.0.0.1:5000;' "$SITE"
+              'proxy_pass http://127.0.0.1:5003;' "$SITE"
           )" -eq 1
 
-          echo "Production still on Blue: PASS"
+          echo "Active production port 5003: PASS"
 
-          echo "=== Switch readiness dry run ==="
+          echo "=== Public HTTPS health ==="
 
-          bash -n "$TOOLS/switch-green-03.sh"
+          curl -fsS --max-time 15 \
+            https://13-70-25-64.sslip.io/health \
+            | grep -Fq '"status":"ok"'
 
-          "$TOOLS/switch-green-03.sh" --dry-run
+          echo "Public production health: PASS"
 
-          echo "Azure Production Readiness: PASS"
+          echo "AZURE PRODUCTION READINESS: PASS"
+          REMOTE
+
+      - name: Validate Reusable Azure Deployment Controller
+        env:
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+          AZURE_VM_USER: ${{ vars.AZURE_VM_USER }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/id_azure \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$AZURE_VM_USER@$AZURE_VM_HOST" \
+            bash -se -- "$RELEASE_SHA" <<'REMOTE'
+          set -euo pipefail
+
+          SHA="$1"
+          TOOLS="$HOME/backend-release-tools"
+
+          echo "=== Deployment controller dry run ==="
+
+          test -x "$TOOLS/deploy-release.sh"
+
+          "$TOOLS/deploy-release.sh" "$SHA" --dry-run
+
+          echo "Reusable deployment controller: PASS"
+          echo "No production switch performed."
           REMOTE
 
       - name: Confirm deployment remains disabled
         run: |
           echo "================================"
-          echo "AZURE READINESS: PASSED"
+          echo "AZURE PRODUCTION READINESS: PASSED"
           echo "Approved source validated."
-          echo "Green Production health validated."
-          echo "Rollback readiness dry-run validated."
-          echo "NO LIVE SWITCH EXECUTED."
+          echo "Green production verified."
+          echo "Reusable deployment controller: DRY RUN."
+          echo "No Nginx traffic switch performed."
+          echo "No PM2 processes restarted."
+          echo "Automatic live deployment is disabled."
           echo "================================"
