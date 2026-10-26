@@ -63,7 +63,7 @@ function DashboardLayout() {
               <p className="page-subtitle">Crowd Verified Time Attendance System</p>
             </div>
           </div>
-          <span className="role-badge">Lecturer Admi</span>
+          <span className="role-badge">Lecturer Admin</span>
         </header>
 
         <main className="dashboard-main">
