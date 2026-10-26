@@ -1,0 +1,81 @@
+name: Backend Azure Automated Release
+
+on:
+  push:
+    branches: [MAIN]
+    paths:
+      - 'web_app/admin-portal/server/**'
+      - '.github/workflows/backend-auto-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-auto-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web_app/admin-portal/server
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web_app/admin-portal/server/package-lock.json
+      - run: npm ci
+      - run: |
+          node --check index.js
+          node --check app.js
+          node --check firebaseAdmin.js
+      - run: npm audit --omit=dev --audit-level=high
+
+  deploy:
+    needs: validate
+    if: github.ref == 'refs/heads/MAIN'
+    runs-on: ubuntu-24.04
+    environment: backend-production
+    steps:
+      - name: Configure pinned Azure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$AZURE_VM_HOST"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_azure
+          chmod 600 ~/.ssh/id_azure
+          printf '%s %s\n' "$AZURE_VM_HOST" \
+            'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILu6Wi9+JXH+fuGS1bbk7KDKXSNSPMp3cheM0aBdhdwb' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/known_hosts -E sha256 \
+            | grep -F 'SHA256:aEf0dLcrStHBlSNz9tMHgPWy++nT27mp0U0p46M3XJU'
+      - name: Deploy approved HEAD to inactive port with short-window rollback
+        env:
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+          AZURE_VM_USER: ${{ vars.AZURE_VM_USER }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AZURE_VM_USER"
+          ssh -i ~/.ssh/id_azure -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$AZURE_VM_USER@$AZURE_VM_HOST" \
+            bash -se -- "$RELEASE_SHA" <<'REMOTE'
+          set -Eeuo pipefail
+          SHA="$1"
+          "$HOME/backend-release-tools/deploy-release.sh" "$SHA" --execute
+          REMOTE
