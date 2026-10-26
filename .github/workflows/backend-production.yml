@@ -123,6 +123,49 @@ jobs:
           ssh-keygen -lf ~/.ssh/known_hosts -E sha256 \
             | grep -F 'SHA256:aEf0dLcrStHBlSNz9tMHgPWy++nT27mp0U0p46M3XJU'
 
+      - name: Check Blue and Green Backend Health
+        env:
+          AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
+          AZURE_VM_USER: ${{ vars.AZURE_VM_USER }}
+        run: |
+          set -euo pipefail
+
+          ssh -o BatchMode=yes \
+            "$AZURE_VM_USER@$AZURE_VM_HOST" \
+            'bash -se' <<'REMOTE'
+          set -euo pipefail
+
+          echo "Checking Blue Production Backend..."
+
+          pm2 describe crowd-attendance-api \
+            | grep -Eq 'status[[:space:]]+│[[:space:]]+online'
+
+          echo "Blue Backend PM2: ONLINE"
+
+          echo "Checking Green QA Backend..."
+
+          pm2 describe crowd-attendance-green \
+            | grep -Eq 'status[[:space:]]+│[[:space:]]+online'
+
+          echo "Green Backend PM2: ONLINE"
+
+          echo "Checking Green HTTP health..."
+
+          RESPONSE="$(curl --fail --silent --show-error \
+            --max-time 10 \
+            http://127.0.0.1:5002/health)"
+
+          printf '%s\n' "$RESPONSE" \
+            | grep -Fq '"status":"ok"'
+
+          printf '%s\n' "$RESPONSE" \
+            | grep -Fq '"service":"crowd-attendance-backend"'
+
+          echo "Green Backend Health: PASSED"
+          echo "Blue-Green Readiness: PASSED"
+          echo "QA MODE ONLY — Not approved for production traffic."
+          REMOTE
+
       - name: Run Azure deployment readiness check
         env:
           AZURE_VM_HOST: ${{ vars.AZURE_VM_HOST }}
@@ -146,7 +189,9 @@ jobs:
       - name: Confirm production remains disabled
         run: |
           echo "Azure readiness validation completed."
+          echo "Blue and Green backend checks completed."
           echo "DRY RUN ONLY."
           echo "No release switched."
+          echo "No Nginx reload."
           echo "No PM2 restart."
           echo "No production deployment."
