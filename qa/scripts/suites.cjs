@@ -513,6 +513,7 @@ async function main(name) {
         [
           'test',
           '--no-pub',
+          '--reporter=expanded',
           'test/round_domain_test.dart',
           '--plain-name',
           'seeded replay permutations preserve round evidence and missed rounds'
